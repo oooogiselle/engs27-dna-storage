@@ -308,6 +308,48 @@ for k in range(24):
 print({n: round(np.mean(v), 2) for n, v in sorted(stress.items())},
       f"failures: {sum(s == 0 for v in stress.values() for s in v)}/24")
 """))
+
+
+def ablation_md():
+    """Part 4: what each piece is worth, from results/ablation_real.csv (python3 ablate.py real)."""
+    import csv
+    path = os.path.join(HERE, "results", "ablation_real.csv")
+    if not os.path.exists(path):
+        return None
+    rows = list(csv.DictReader(open(path)))
+    names = {"full": "Full design", "raw-bytes": "No compression (raw bytes)",
+             "zlib": "zlib instead of context mixing", "no-constraint": "GG/CC allowed (2 bits/base)",
+             "no-parity": "No parity strands", "fixed-plan": "Fixed L = 200, r = 2",
+             "safe": "Risk capped at 1% (`MAX_FAIL = 0.01`)"}
+    lengths = sorted({int(r["chars"]) for r in rows})
+    out = ["## Part 4: What each piece is worth",
+           "",
+           "`ablate.py` switches off one piece of the design at a time (without editing `solution.py`) and "
+           "runs the same random excerpts through the real channel. Mean score per passage length, and "
+           "passages that did not decode exactly. Failure *rates* need more runs, so "
+           "`results/ablation_sim_summary.txt` has 40 simulated runs per cell. See `writeup/walkthrough.md` "
+           "for what each row means.",
+           "",
+           "| variant | " + " | ".join(f"{n} chars" for n in lengths) + " | mean | failed |",
+           "|---|" + "---|" * (len(lengths) + 2)]
+    for v, label in names.items():
+        rs = [r for r in rows if r["variant"] == v]
+        if not rs:
+            continue
+        per = [sum(float(r["score"]) for r in rs if int(r["chars"]) == n) /
+               max(1, sum(int(r["chars"]) == n for r in rs)) for n in lengths]
+        fails = sum(float(r["e"]) > 0 for r in rs)
+        out.append(f"| {label} | " + " | ".join(f"{s:.2f}" for s in per) +
+                   f" | {sum(per) / len(per):.2f} | {fails}/{len(rs)} |")
+    out += ["",
+            "Compression and the GG/CC-free code are the big wins. Parity matters only for long passages "
+            "(the planner already uses none on short ones), the planner matters most for short passages, "
+            "and the risk cap trades about 15% of the mean score for fewer failures."]
+    return "\n".join(out)
+
+
+if ablation_md():
+    cells.append(md(ablation_md()))
 cells.append(md(src(13)))
 
 nb["cells"] = cells
