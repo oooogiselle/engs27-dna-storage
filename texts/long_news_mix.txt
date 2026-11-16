@@ -1,0 +1,28 @@
+City officials announced on Tuesday that the long-delayed renovation of the downtown library will begin next spring, ending more than six years of debate over the building's future. The project, expected to cost $48 million, will add a children's wing, expand public computer access, and restore the original 1912 reading room, whose ceiling has been closed to visitors since a leak was discovered in 2019.
+
+"This building belongs to everyone in the city," said Mayor Ellen Park at a press conference on the library steps. "For too long we treated it as a problem to be managed. Now we are treating it as an investment." The council approved the funding in a 7-2 vote last month after a series of public meetings that drew hundreds of residents.
+
+Critics argued that the money would be better spent on neighborhood branches, several of which have reduced their hours because of staffing shortages. Councilmember David Ortiz, who voted against the plan, said he supported the renovation in principle but worried about the timeline. "We have heard these promises before," he said. "I want to see a shovel in the ground before I celebrate."
+
+During construction, the main collection will move to a temporary location on Fifth Avenue, and the library expects to keep most services running. Officials said the work should be finished by the fall of 2029.
+
+The tide goes out, the tide comes in,
+and leaves the sand as smooth as skin;
+the gulls go up, the gulls come down,
+and circle slow above the town.
+
+I walked the shore when I was young
+with salt and sunlight on my tongue,
+and every shell I carried home
+I thought was mine, and mine alone.
+
+Now I am older, and I see
+the sea was never kept by me;
+it lent me what it chose to lend,
+and took it back again, my friend.
+
+A hash table stores key-value pairs in an array of buckets, using a hash function to compute the index at which each key should live. When two keys hash to the same bucket, a collision occurs, and the table must resolve it, either by chaining (keeping a small list in each bucket) or by open addressing (probing for the next free slot). The expected cost of a lookup depends on the load factor, the ratio of stored items to buckets. With a good hash function and a load factor below about 0.7, lookups, insertions and deletions all take constant time on average.
+
+Resizing is the price of this speed. When the load factor crosses a threshold, the table allocates a larger array, typically twice the size, and reinserts every item. A single resize costs time proportional to the number of items, but because the size doubles each time, the total cost of all resizes over n insertions is still O(n), so the amortized cost per insertion remains constant. This argument, sometimes called the doubling trick, appears throughout the design of dynamic data structures.
+
+Choosing a hash function is subtle. A function that is fast but poorly mixed will send structured keys, such as consecutive integers or strings sharing a long prefix, into a handful of buckets, and performance will collapse toward that of a linked list. Modern implementations often add a random seed to the hash at start-up, which defends against attackers who would otherwise craft inputs that all collide. Python, for example, randomi
