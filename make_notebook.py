@@ -246,31 +246,39 @@ cells.append(md("""
 |---|---|---|
 | breaks | after `GG` or `CC`: p ≈ 0.25; elsewhere p ≈ 0.010, independent | never write `GG`/`CC` (costs 8.6%: 1.83 instead of 2 bits/base) |
 | full reads | with no GG/CC: $(1-p)^{L-1}$ with p ≈ 0.010 (74% at L=30, 30% at L=120) | strands of 250–450 bases still get dozens of whole-strand reads |
-| read errors | ≈0.5% per base: ~85% substitutions, ~15% insertions | vote across many whole-strand reads; CRC on every strand |
-| lost strands | ≈3% of strands never come back, fixed per sequence, not tied to length or motif | Reed–Solomon parity strands across strands |
+| read errors | ≈0.5% per base: ~85% substitutions, ~15% insertions | vote across many whole-strand reads; 8 parity bits on every strand |
+| lost strands | ≈3% of strands never come back, fixed per sequence, not tied to length or motif | XOR parity strands across strands |
 | coverage | 4 reads/char at ~2 bases/char → ~2 reads per stored base, each 50–100 bases long | coverage is plentiful: compression is the main lever |
 """))
 
 cells.append(md("""
 ## Part 2: Our solution
 
-* **Compression.** A small bitwise context-mixing model (orders 0–4 and 6, plus a word
-  model, mixed by an online logistic mixer, with an APM stage), driving a binary arithmetic coder.
-  It is adaptive: the decoder learns the same model while decoding, so no table is sent.
-  An end-of-text flag replaces a length header. About 3.5–4 bits/char on English, against 8 for raw bytes.
+* **Compression.** A Huffman code built for this passage (Section 3.2.5). The symbols are the
+  passage's bytes plus an end-of-text symbol, so no length field is needed. The decoder needs the
+  code, so the codeword *lengths* are sent first (a 128-bit "which characters appear" table plus
+  4 bits per character, or a symbol list when that is shorter); both sides then assign codewords
+  in the same order, which gives the same prefix-free code. About 4.6–6 bits/char on English,
+  against 8 for raw bytes; the table is a large share of that on short passages.
 * **Constrained code.** Each strand's bits are one big integer, *unranked* into the
-  set of length-$L$ strings with no `GG` and no `CC` (enumerative coding, exactly
-  $\\lfloor\\log_2 N(L)\\rfloor \\approx 1.83L$ bits). One strand error never spreads to another strand.
-* **Strand format.** `[index 8 bits | number of data strands 8 bits | payload | CRC-8]`.
-* **Erasure code.** Systematic Cauchy Reed–Solomon over GF(256) across strands: any `r` lost
-  strands can be rebuilt from `r` parity strands.
+  set of length-$L$ strings with no `GG` and no `CC` (counting writable strings, Section 6.1.4:
+  exactly $\\lfloor\\log_2 N(L)\\rfloor \\approx 1.83L$ bits). One strand error never spreads to another strand.
+* **Strand format.** `[index 8 bits | data strands n 8 bits | parity strands r 4 bits | payload | 8 parity bits]`.
+  Parity bit $j$ is the parity of every 8th bit starting at $j$ (Section 3.3.3), so any burst of up to
+  8 flipped bits is caught.
+* **XOR parity strands.** Each parity strand is the XOR of a group of data strands, so a group
+  missing exactly one strand can rebuild it. The groups overlap like a Hamming code's (Section 3.3.4):
+  every data strand gets an $r$-bit label with at least two 1s and joins the groups where its label
+  has a 1, so it is covered twice. The decoder repeatedly rebuilds any group missing one strand.
 * **Choosing L and r.** For each passage the encoder picks the strand length and number of parity
-  strands that maximise expected score, $\\text{density} \\times P(\\text{at most } r \\text{ strands fail})$,
-  where a strand fails if it is lost (3.5%) or gets fewer than 8 whole-strand reads (Poisson model).
+  strands that maximise expected score, $\\text{density} \\times P(\\text{every data strand recovered})$.
+  A strand fails if it is lost (3.5%) or gets fewer than 8 whole-strand reads (Poisson model, Section 7.1);
+  the number of failed strands is binomial (Section 2.4), and for each count we work out the fraction of
+  loss patterns the XOR groups can repair.
 * **Decoding.** The strand length shows up as a spike in the read-length histogram. Whole-strand
   reads are clustered by Hamming distance, each cluster gets a per-position majority vote, the
-  consensus is ranked back to bits and CRC-checked, missing strands are rebuilt from parity, and
-  the stream is decompressed. If too many strands are missing, we decode up to the first gap.
+  consensus is ranked back to bits and parity-checked, missing strands are rebuilt from the XOR
+  strands, and the stream is Huffman-decoded. If strands are still missing, we decode up to the first gap.
 
 **This cell is the solution.** Running it saves `solution.py`, the file we hand in.
 """))
@@ -318,7 +326,9 @@ def ablation_md():
         return None
     rows = list(csv.DictReader(open(path)))
     names = {"full": "Full design", "raw-bytes": "No compression (raw bytes)",
-             "zlib": "zlib instead of context mixing", "no-constraint": "GG/CC allowed (2 bits/base)",
+             "fixed-table": "Huffman, fixed English table (none sent)", "zlib": "zlib instead of Huffman",
+             "context-mixing": "Context mixing instead of Huffman (earlier version)",
+             "no-constraint": "GG/CC allowed (2 bits/base)",
              "no-parity": "No parity strands", "fixed-plan": "Fixed L = 200, r = 2",
              "safe": "Risk capped at 1% (`MAX_FAIL = 0.01`)"}
     lengths = sorted({int(r["chars"]) for r in rows})
@@ -344,7 +354,10 @@ def ablation_md():
     out += ["",
             "Compression and the GG/CC-free code are the big wins. Parity matters only for long passages "
             "(the planner already uses none on short ones), the planner matters most for short passages, "
-            "and the risk cap trades about 15% of the mean score for fewer failures."]
+            "and the risk cap trades about 20% of the mean score for fewer failures. A fixed English Huffman "
+            "table beats the per-passage table on short passages, where sending the table is expensive. "
+            "The context-mixing row is our earlier compressor, which is not course material: it shows "
+            "what keeping to Huffman costs on long passages."]
     return "\n".join(out)
 
 

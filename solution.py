@@ -1,187 +1,162 @@
 """ENGS 27 final project: storing English text in DNA.
 
 Pipeline
-  encode: text -> context-mixing compressor -> bit stream
-          -> split into strands of equal length L, each strand = [index | payload | CRC-8]
+  encode: text -> Huffman code built for this passage (its code lengths are sent first)
+          -> split into strands of equal length L, each strand = [index | n | r | payload | parity]
           -> each strand's bits are mapped to a DNA string with NO "GG" and NO "CC"
              (enumerative code; the real channel breaks ~25x more often after GG/CC)
+          -> r extra XOR parity strands, grouped like a Hamming code, rebuild lost strands
   decode: estimate L from the spike in the read-length histogram (full-length reads)
           -> cluster full-length reads by Hamming distance, per-position majority vote
-          -> unrank each consensus, check CRC, keep the best-supported copy of each index
-          -> concatenate payloads and decompress; stop at the first missing strand.
+          -> unrank each consensus, check its parity bits, keep the best-supported copy
+          -> rebuild lost strands from the XOR parity strands
+          -> concatenate payloads and Huffman-decode; stop at the first strand still missing.
 
-Nothing about the text is shared outside the strands: the compressor is adaptive and
-the decoder rebuilds the same model as it goes.
+Everything the decoder needs travels in the strands: the Huffman code lengths are the
+first bits of the message, and every strand carries n (data strands) and r (parity strands).
+Every technique here is from the course: Huffman coding (3.2.5), parity checks and Hamming
+codes (3.3.3-3.3.4), counting writable strings (6.1.4), binomial and Poisson models (2.4, 7.1).
 """
 import collections
+import heapq
 import math
+import random
 
 # ----------------------------------------------------------------------------------
 # Tunable parameters
 # ----------------------------------------------------------------------------------
-CRC_BITS = 8
-HDR_BITS = 16      # 8-bit strand index + 8-bit number of data strands
+CHECK_BITS = 8     # parity bits at the end of every strand
+HDR_BITS = 20      # 8-bit strand index + 8-bit number of data strands + 4-bit parity count
 P_LOST = 0.035     # measured ~3% of strands never come back; plan for a bit more
 P_BREAK = 0.0101   # measured break probability per site once GG/CC are banned
 L_RANGE = range(60, 801, 4)
 MIN_FULL = 8       # want at least this many full-length reads per strand
 MAX_FAIL = 1.0     # cap on P(passage unrecoverable); 1.0 = pure expected-score maximising
+MAX_R = 12         # most parity strands (fits in the 4-bit field)
 
 # ----------------------------------------------------------------------------------
-# 1. Compressor: tiny bitwise context mixing (orders 0-4, 6 and a word model)
+# 1. Compressor: a Huffman code built for this passage (Section 3.2.5)
 # ----------------------------------------------------------------------------------
-_PREC = 1 << 16
+# Symbols are the passage's bytes plus an end-of-text symbol (EOT), so no length field is
+# needed. The decoder needs the code, so we send it first, compactly: each symbol's codeword
+# length. Both sides then hand out codewords in the same order (shortest first, then by
+# symbol), which gives the same prefix-free code from the lengths alone.
+EOT = 256
+MAX_LEN = 15       # codeword lengths are sent in 4 bits
 
 
-def _stretch(p):
-    return math.log(p / (1 - p))
+def _huffman_lengths(freq):
+    """Codeword length of every symbol: repeatedly merge the two rarest groups; every
+    merge makes each symbol in them one bit longer."""
+    heap = [(f, s, (s,)) for s, f in freq.items()]
+    heapq.heapify(heap)
+    if len(heap) == 1:
+        return {heap[0][1]: 1}
+    depth = collections.Counter()
+    tie = 1000
+    while len(heap) > 1:
+        f1, _, a = heapq.heappop(heap)
+        f2, _, b = heapq.heappop(heap)
+        for s in a + b:
+            depth[s] += 1
+        heapq.heappush(heap, (f1 + f2, tie, a + b))
+        tie += 1
+    return dict(depth)
 
 
-def _squash(x):
-    if x > 30:
-        x = 30
-    elif x < -30:
-        x = -30
-    return 1 / (1 + math.exp(-x))
+def _code_lengths(data):
+    freq = collections.Counter(data)
+    freq[EOT] = 1
+    lens = _huffman_lengths(freq)
+    while max(lens.values()) > MAX_LEN:           # very rare: flatten the counts and retry
+        freq = {s: (f + 1) // 2 for s, f in freq.items()}
+        lens = _huffman_lengths(freq)
+    return lens
 
 
-class _BitCoder:
-    """Binary arithmetic coder, 32-bit range. Encoder when bits is None."""
-
-    def __init__(self, bits=None):
-        self.lo, self.hi = 0, 0xFFFFFFFF
-        self.bits = bits
-        if bits is None:
-            self.out = []
-        else:
-            self.pos, self.x = 0, 0
-            for _ in range(32):
-                self.x = (self.x << 1) | self._nb()
-
-    def _nb(self):
-        b = self.bits[self.pos] if self.pos < len(self.bits) else 0
-        self.pos += 1
-        return b
-
-    def code(self, p1, bit=None):
-        q = min(max(int(p1 * _PREC), 1), _PREC - 1)
-        r = self.hi - self.lo
-        mid = self.lo + (r >> 16) * q + (((r & 0xFFFF) * q) >> 16)
-        if bit is None:
-            bit = 1 if self.x <= mid else 0
-        if bit:
-            self.hi = mid
-        else:
-            self.lo = mid + 1
-        while (self.lo ^ self.hi) & 0x80000000 == 0:
-            if self.bits is None:
-                self.out.append(self.hi >> 31)
-            else:
-                self.x = ((self.x << 1) & 0xFFFFFFFF) | self._nb()
-            self.lo = (self.lo << 1) & 0xFFFFFFFF
-            self.hi = ((self.hi << 1) & 0xFFFFFFFF) | 1
-        return bit
-
-    def finish(self):
-        for i in range(32):
-            self.out.append((self.lo >> (31 - i)) & 1)
-            pref = self.lo >> (31 - i) << (31 - i)
-            if pref >= self.lo and (pref | ((1 << (31 - i)) - 1)) <= self.hi:
-                break
-        return self.out
+def _codebook(lens):
+    """Codewords from lengths: shortest first, ties by symbol (the same on both sides)."""
+    code, prev_len, book = 0, 0, {}
+    for s in sorted(lens, key=lambda s: (lens[s], s)):
+        code <<= lens[s] - prev_len
+        book[s] = (code, lens[s])
+        code += 1
+        prev_len = lens[s]
+    return book
 
 
-class _Model:
-    ORDERS = (1, 2, 3, 4, 6)
-    LR0, LR1, LIMIT = 0.01, 0.3, 255     # mixer learning rate decays as the text goes on
+def _write_header(lens):
+    """Send the code lengths. Two layouts; a flag bit says which one is shorter:
+    0: 9-bit symbol count, then (8-bit symbol, 4-bit length) per byte symbol;
+    1: 128-bit table of which ASCII characters appear, then a 4-bit length for each.
+    Both end with the 4-bit length of EOT."""
+    syms = sorted(s for s in lens if s != EOT)
+    a = [0] + _to_bits(len(syms), 9)
+    for s in syms:
+        a += _to_bits(s, 8) + _to_bits(lens[s], 4)
+    best = a
+    if all(s < 128 for s in syms):
+        b = [1] + [int(c in lens) for c in range(128)]
+        for s in syms:
+            b += _to_bits(lens[s], 4)
+        if len(b) < len(a):
+            best = b
+    return best + _to_bits(lens[EOT], 4)
 
-    def __init__(self):
-        self.t = {}
-        self.w = {}
-        self.apm = {}
-        self.hist = []
-        self.wordh = 0
-        self.more = 0      # bytes seen, drives the end-of-text flag
 
-    def p_more(self):
-        return (self.more + 1) / (self.more + 2)
-
-    def code_byte(self, coder, byte=None):
-        h = self.hist
-        cs = [("o0", 0)]
-        for k in self.ORDERS:
-            cs.append((k, bytes(h[-k:])) if len(h) >= k else (k, None))
-        cs.append(("w", self.wordh))
-        node = 1
-        last = h[-1] if h else 0
-        lr = self.LR0 + self.LR1 / math.sqrt(1 + len(h))
-        for i in range(8):
-            bit_in = None if byte is None else (byte >> (7 - i)) & 1
-            slots, st = [], []
-            for m, c in cs:
-                if c is None:
-                    slots.append(None)
-                    st.append(0.0)
-                    continue
-                key = (m, c, node)
-                e = self.t.get(key)
-                if e is None:
-                    e = self.t[key] = [0.5, 0]
-                slots.append(e)
-                st.append(_stretch(min(max(e[0], 1e-4), 1 - 1e-4)) if e[1] else 0.0)
-            st.append(0.3)
-            sel = (node, min(len(h), 2))
-            w = self.w.get(sel)
-            if w is None:
-                w = self.w[sel] = [0.3] * len(st)
-            dot = sum(a * b for a, b in zip(w, st))
-            p = _squash(dot)
-            bucket = 0 if dot <= -8 else (32 if dot >= 8 else int((dot + 8) * 2))
-            ak = (last, node, bucket)
-            a = self.apm.get(ak)
-            pf = p if a is None else 0.5 * (p + a)
-            bit = coder.code(pf, bit_in)
-            a0 = p if a is None else a
-            self.apm[ak] = a0 + 0.05 * (bit - a0)
-            err = bit - p
-            for j in range(len(w)):
-                w[j] += lr * err * st[j]
-            for e in slots:
-                if e is not None:
-                    e[1] = min(e[1] + 1, self.LIMIT)
-                    e[0] += (bit - e[0]) / (e[1] + 0.5)
-            node = node * 2 + bit
-        b = node & 0xFF
-        h.append(b)
-        if 65 <= b <= 90 or 97 <= b <= 122 or b >= 128:
-            self.wordh = (self.wordh * 0x2F0B3 + (b | 32) + 1) & 0xFFFFFFFFFF   # explicit, version-proof
-        else:
-            self.wordh = 0
-        return b
+def _read_header(bits):
+    """Inverse of _write_header. Returns (lens, position after the header)."""
+    pos, lens = 1, {}
+    if bits[0] == 0:
+        count = _to_int(bits[pos:pos + 9])
+        pos += 9
+        for _ in range(count):
+            lens[_to_int(bits[pos:pos + 8])] = _to_int(bits[pos + 8:pos + 12])
+            pos += 12
+    else:
+        present = [c for c in range(128) if bits[pos + c]]
+        pos += 128
+        for c in present:
+            lens[c] = _to_int(bits[pos:pos + 4])
+            pos += 4
+    lens[EOT] = _to_int(bits[pos:pos + 4])
+    pos += 4
+    if any(not 1 <= v <= MAX_LEN for v in lens.values()):
+        raise ValueError("damaged header")
+    return lens, pos
 
 
 def compress(data):
-    m, c = _Model(), _BitCoder()
-    for b in data:
-        c.code(m.p_more(), 1)
-        m.more += 1
-        m.code_byte(c, b)
-    c.code(m.p_more(), 0)
-    return c.finish()
+    lens = _code_lengths(data)
+    book = _codebook(lens)
+    bits = _write_header(lens)
+    for s in list(data) + [EOT]:
+        code, n = book[s]
+        bits += _to_bits(code, n)
+    return bits
 
 
 def decompress(bits, stop_bit=None, limit=1 << 20):
-    """Decode bytes. If stop_bit is given, stop once the decoder has had to read past
-    that bit position (the data there is missing, so later output would be garbage)."""
-    m, c = _Model(), _BitCoder(bits)
+    """Decode bytes. If stop_bit is given, stop before reading past that bit position
+    (the data there is missing, so later output would be garbage)."""
+    lens, pos = _read_header(bits)
+    lookup = {(n, code): s for s, (code, n) in _codebook(lens).items()}
+    end = len(bits) if stop_bit is None else min(len(bits), stop_bit)
     out = []
     while len(out) < limit:
-        if stop_bit is not None and c.pos - 32 > stop_bit:
+        code, n = 0, 0
+        while True:
+            if pos >= end or n >= MAX_LEN:
+                return bytes(out)
+            code = code * 2 + bits[pos]
+            pos += 1
+            n += 1
+            s = lookup.get((n, code))
+            if s is not None:
+                break
+        if s == EOT:
             break
-        if not c.code(m.p_more()):
-            break
-        m.more += 1
-        out.append(m.code_byte(c))
+        out.append(s)
     return bytes(out)
 
 
@@ -244,105 +219,141 @@ def rank(s):
 
 
 # ----------------------------------------------------------------------------------
-# 3. Reed-Solomon style erasure code across strands (systematic Cauchy code, GF(256))
+# 3. XOR parity strands across strands, grouped like a Hamming code (Sections 3.3.3-3.3.4)
 # ----------------------------------------------------------------------------------
-_EXP, _LOG = [0] * 512, [0] * 256
-_v = 1
-for _i in range(255):
-    _EXP[_i] = _v
-    _LOG[_v] = _i
-    _v <<= 1
-    if _v & 0x100:
-        _v ^= 0x11D
-for _i in range(255, 512):
-    _EXP[_i] = _EXP[_i - 255]
+# A parity strand is the XOR of a group of data strands: if exactly one strand of the group
+# is lost, XOR-ing the parity strand with the strands that did arrive gives it back.
+# With r parity strands, every data strand gets a label: an r-bit number with at least two
+# 1s (Hamming skips the powers of two for the same reason). Data strand i is in group j when
+# bit j of its label is 1, so each data strand is covered by at least two parity strands.
+# Labels with two 1s are used first, then three, ...
+# Decoding repeats one step: find a group missing exactly one strand and rebuild it.
+def _labels(r):
+    if r == 1:
+        return [1]                       # one parity strand: the XOR of all data strands
+    return sorted((x for x in range(1, 2 ** r) if bin(x).count("1") >= 2),
+                  key=lambda x: (bin(x).count("1"), x))
 
 
-def _gmul(a, b):
-    return 0 if a == 0 or b == 0 else _EXP[_LOG[a] + _LOG[b]]
+def _groups(n, r):
+    """groups[j] = the data strands that parity strand j covers."""
+    if r == 0:
+        return []
+    labels = _labels(r)
+    groups = [[] for _ in range(r)]
+    for i in range(n):
+        label = labels[i % len(labels)]
+        for j in range(r):
+            if label >> j & 1:
+                groups[j].append(i)
+    return groups
 
 
-def _ginv(a):
-    return _EXP[255 - _LOG[a]]
-
-
-def _coef(j, i):
-    """Coefficient of data strand i in parity strand j: 1 / (x_j + y_i), Cauchy."""
-    return _ginv((255 - j) ^ i)
+def _xor(rows, K):
+    out = [0] * K
+    for row in rows:
+        for t in range(K):
+            out[t] ^= row[t]
+    return out
 
 
 def _parity(data, r):
     K = len(data[0])
-    out = []
-    for j in range(r):
-        p = [0] * K
-        for i, d in enumerate(data):
-            c = _coef(j, i)
-            lc = _LOG[c]
-            for t in range(K):
-                if d[t]:
-                    p[t] ^= _EXP[lc + _LOG[d[t]]]
-        out.append(p)
-    return out
+    return [_xor([data[i] for i in g], K) for g in _groups(len(data), r)]
 
 
-def _solve_inverse(A):
-    """Invert a square matrix over GF(256) (Gauss-Jordan)."""
-    m = len(A)
-    M = [row[:] + [int(i == j) for j in range(m)] for i, row in enumerate(A)]
-    for col in range(m):
-        piv = next(r for r in range(col, m) if M[r][col])
-        M[col], M[piv] = M[piv], M[col]
-        inv = _ginv(M[col][col])
-        M[col] = [_gmul(inv, x) for x in M[col]]
-        for r in range(m):
-            if r != col and M[r][col]:
-                f = M[r][col]
-                M[r] = [x ^ _gmul(f, y) for x, y in zip(M[r], M[col])]
-    return [row[m:] for row in M]
+def _recover(data, parity, n, r):
+    """data: {i: payload} for received data strands; parity: {j: payload}.
+    Rebuilds what it can and returns the updated {i: payload} (may still have gaps)."""
+    data = dict(data)
+    groups = _groups(n, r)
+    progress = True
+    while progress and len(data) < n:
+        progress = False
+        for j, g in enumerate(groups):
+            if j not in parity:
+                continue
+            missing = [i for i in g if i not in data]
+            if len(missing) == 1:
+                K = len(parity[j])
+                data[missing[0]] = _xor([parity[j]] + [data[i] for i in g if i != missing[0]], K)
+                progress = True
+    return data
 
 
-def _recover(data, parity, n):
-    """data: {i: bytes-list} for received data strands; parity: {j: list}.
-    Returns the full list of n data payloads, or None if not enough survived."""
-    missing = [i for i in range(n) if i not in data]
-    if not missing:
-        return [data[i] for i in range(n)]
-    use = sorted(parity)[:len(missing)]
-    if len(use) < len(missing):
-        return None
-    K = len(next(iter(parity.values())))
-    rhs = []
-    for j in use:
-        v = parity[j][:]
-        for i, d in data.items():
-            c = _coef(j, i)
-            for t in range(K):
-                if d[t]:
-                    v[t] ^= _gmul(c, d[t])
-        rhs.append(v)
-    Ainv = _solve_inverse([[_coef(j, i) for i in missing] for j in use])
-    for a, i in enumerate(missing):
-        row = [0] * K
-        for b in range(len(use)):
-            c = Ainv[a][b]
-            if c:
-                for t in range(K):
-                    if rhs[b][t]:
-                        row[t] ^= _gmul(c, rhs[b][t])
-        data[i] = row
-    return [data[i] for i in range(n)]
+# How likely is the passage to be rebuilt? For n data and r parity strands, _fixable(n, r, k)
+# is the fraction of ways to lose k of the N = n + r strands that the decoder survives
+# (exact for k <= 2, Monte Carlo with a fixed seed for k >= 3). Combined with the binomial
+# chance of losing k strands (law of total probability), it gives P(success).
+_FIX_CACHE = {}
+
+
+def _survives(n, masks, lost):
+    """Peeling on bitmasks: data strands are bits 0..n-1, parity strand j is bit n+j."""
+    missing = lost & ((1 << n) - 1)
+    live = [g for j, g in enumerate(masks) if not lost >> (n + j) & 1]
+    progress = True
+    while missing and progress:
+        progress = False
+        for g in live:
+            x = g & missing
+            if x and x & (x - 1) == 0:   # exactly one strand of this group is missing
+                missing ^= x
+                progress = True
+    return missing == 0
+
+
+def _fixable(n, r, k):
+    key = (n, r, k)
+    if key not in _FIX_CACHE:
+        N = n + r
+        masks = [sum(1 << i for i in g) for g in _groups(n, r)]
+        if k == 0:
+            f = 1.0
+        elif r == 0:
+            f = 0.0
+        elif k == 1:
+            f = sum(_survives(n, masks, 1 << a) for a in range(N)) / N
+        elif k == 2 and N * (N - 1) // 2 <= 800:
+            f = sum(_survives(n, masks, (1 << a) | (1 << b))
+                    for a in range(N) for b in range(a + 1, N)) / (N * (N - 1) // 2)
+        else:
+            rng = random.Random(7919 * N + 31 * r + k)
+            trials, ok = 120, 0
+            for _ in range(trials):
+                lost = 0
+                while bin(lost).count("1") < k:
+                    lost |= 1 << int(rng.random() * N)
+                ok += _survives(n, masks, lost)
+            f = ok / trials
+        _FIX_CACHE[key] = f
+    return _FIX_CACHE[key]
+
+
+def _p_success(n, r, q):
+    """P(every data strand is recovered) when each of the n + r strands fails with prob q."""
+    N = n + r
+    total, mass, term = 0.0, 0.0, (1 - q) ** N
+    for k in range(N + 1):
+        total += term * _fixable(n, r, k)
+        mass += term
+        if 1 - mass < 1e-5 or k >= 10:
+            break
+        term = term * (N - k) / (k + 1) * q / (1 - q) if q < 1 else 0.0
+    return min(total, 1.0)
 
 
 # ----------------------------------------------------------------------------------
-# 4. Strand framing: [index 8 | n_data 8 | K payload bytes | pad | CRC-8]
+# 4. Strand framing: [index 8 | n_data 8 | r 4 | K payload bytes | pad | 8 parity bits]
 # ----------------------------------------------------------------------------------
-def _crc(bits, salt=0):
-    r = 0x5A ^ salt
-    for b in bits:
-        r ^= b << 7
-        r = ((r << 1) ^ 0x07) & 0xFF if r & 0x80 else (r << 1) & 0xFF
-    return [(r >> (CRC_BITS - 1 - i)) & 1 for i in range(CRC_BITS)]
+def _check(bits, salt=0):
+    """8 parity bits (Section 3.3.3): bit j is the parity of every 8th bit starting at j.
+    Any burst of up to 8 flipped bits changes at least one of them. The salt (from L)
+    makes a strand read at the wrong length unlikely to pass."""
+    p = [(salt >> (CHECK_BITS - 1 - j)) & 1 for j in range(CHECK_BITS)]
+    for i, b in enumerate(bits):
+        p[i % CHECK_BITS] ^= b
+    return p
 
 
 def _to_int(bits):
@@ -358,16 +369,16 @@ def _to_bits(x, n):
 
 def _K(L):
     """Payload bytes per strand of length L."""
-    return (capacity(L) - HDR_BITS - CRC_BITS) // 8
+    return (capacity(L) - HDR_BITS - CHECK_BITS) // 8
 
 
-def _frame(index, n, payload, L):
+def _frame(index, n, r, payload, L):
     cap = capacity(L)
-    bits = _to_bits(index, 8) + _to_bits(n, 8)
+    bits = _to_bits(index, 8) + _to_bits(n, 8) + _to_bits(r, 4)
     for byte in payload:
         bits += _to_bits(byte, 8)
-    bits += [0] * (cap - CRC_BITS - len(bits))
-    bits += _crc(bits, L & 0xFF)
+    bits += [0] * (cap - CHECK_BITS - len(bits))
+    bits += _check(bits, L & 0xFF)
     return unrank(_to_int(bits), L)
 
 
@@ -380,26 +391,17 @@ def _unframe(strand):
     if x >> cap:
         return None
     bits = _to_bits(x, cap)
-    if _crc(bits[:-CRC_BITS], L & 0xFF) != bits[-CRC_BITS:]:
+    if _check(bits[:-CHECK_BITS], L & 0xFF) != bits[-CHECK_BITS:]:
         return None
-    index, n = _to_int(bits[:8]), _to_int(bits[8:16])
+    index, n, r = _to_int(bits[:8]), _to_int(bits[8:16]), _to_int(bits[16:20])
     K = _K(L)
-    payload = [_to_int(bits[16 + 8 * t:24 + 8 * t]) for t in range(K)]
-    return index, n, payload
+    payload = [_to_int(bits[HDR_BITS + 8 * t:HDR_BITS + 8 * t + 8]) for t in range(K)]
+    return index, n, r, payload
 
 
 # ----------------------------------------------------------------------------------
 # 5. Choosing strand length L and number of parity strands r for each passage
 # ----------------------------------------------------------------------------------
-def _binom_tail_ok(N, r, q):
-    """P(at most r of N strands fail), each failing independently with prob q."""
-    p, term = 0.0, (1 - q) ** N
-    for k in range(r + 1):
-        p += term
-        term = term * (N - k) / (k + 1) * q / (1 - q) if q < 1 else 0
-    return min(p, 1.0)
-
-
 def _plan(nbits, nchars):
     best = None
     for L in L_RANGE:
@@ -409,7 +411,7 @@ def _plan(nbits, nchars):
         n = max(1, -(-nbits // (8 * K)))
         if n > 200:
             continue
-        for r in range(0, min(12, 255 - n) + 1):
+        for r in [0, 1] + list(range(3, MAX_R + 1)):
             N = n + r
             # reads per surviving strand, and expected full-length reads among them
             lam = 4 * nchars / (N * (1 - P_LOST)) * (1 - P_BREAK) ** (L - 1)
@@ -419,7 +421,7 @@ def _plan(nbits, nchars):
                 p_few += term
                 term *= lam / (k + 1)
             q = P_LOST + (1 - P_LOST) * p_few
-            ok = _binom_tail_ok(N, r, q)
+            ok = _p_success(n, r, q)
             if 1 - ok > MAX_FAIL:
                 continue
             ev = ok / (N * L)
@@ -444,8 +446,8 @@ def encode(text):
     K = _K(L)
     bits = bits + [0] * (n * K * 8 - len(bits))
     data = [[_to_int(bits[8 * (i * K + t):8 * (i * K + t) + 8]) for t in range(K)] for i in range(n)]
-    strands = [_frame(i, n, d, L) for i, d in enumerate(data)]
-    strands += [_frame(n + j, n, p, L) for j, p in enumerate(_parity(data, r))]
+    strands = [_frame(i, n, r, d, L) for i, d in enumerate(data)]
+    strands += [_frame(n + j, n, r, p, L) for j, p in enumerate(_parity(data, r))]
     return strands
 
 
@@ -516,7 +518,7 @@ def _decode(reads):
     if not reads:
         return ""
     # Try the likely strand lengths; keep the one whose reads decode to the most
-    # CRC-valid strands (weighted by how many reads support them).
+    # parity-valid strands (weighted by how many reads support them).
     choice = None
     for L in _candidate_lengths(reads):
         best, nvotes = {}, collections.Counter()
@@ -524,8 +526,8 @@ def _decode(reads):
             got = _unframe(cons)
             if got is None:
                 continue
-            i, n, payload = got
-            nvotes[n] += support
+            i, n, r, payload = got
+            nvotes[(n, r)] += support
             if i not in best or support > best[i][0]:
                 best[i] = (support, payload)
         total = sum(v[0] for v in best.values())
@@ -534,19 +536,17 @@ def _decode(reads):
     if choice is None:
         return ""
     _, L, best, nvotes = choice
-    n = nvotes.most_common(1)[0][0]
+    n, r = nvotes.most_common(1)[0][0]      # every strand carries n and r, so take a vote
     data = {i: v[1] for i, v in best.items() if i < n}
-    parity = {i - n: v[1] for i, v in best.items() if i >= n}
-    full = _recover(dict(data), parity, n)
+    parity = {i - n: v[1] for i, v in best.items() if n <= i < n + r}
+    data = _recover(data, parity, n, r)
     K = _K(L)
-    stop = None
-    if full is None:                        # too many losses: decode up to the first gap
-        full = []
-        for i in range(n):
-            if i not in data:
-                stop = 8 * K * i
-                break
-            full.append(data[i])
+    full, stop = [], None
+    for i in range(n):                      # decode up to the first strand still missing
+        if i not in data:
+            stop = 8 * K * i
+            break
+        full.append(data[i])
     bits = []
     for d in full:
         for byte in d:

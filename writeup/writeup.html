@@ -17,11 +17,12 @@
   td, th { padding: 0 5pt; border-bottom: 0.5pt solid #999; text-align: right; }
   td:first-child, th:first-child { text-align: left; padding-left: 0; }
   tr.us td { font-weight: bold; }
+  tr.ref td { font-style: italic; }
 </style>
 </head>
 <body>
 <h1>ENGS 27 Final Project: Storing Text in DNA</h1>
-<div class="by">Giselle Wu and Yvonne Liu &middot; real-channel score 3.2&ndash;3.5 on 150&ndash;4,000-character passages (starter baseline 0.87)</div>
+<div class="by">Giselle Wu and Yvonne Liu &middot; course methods only &middot; real-channel mean 2.46&ndash;2.66, 53/54 exact (baseline 0.87)</div>
 
 <h2>What we learned about the channel</h2>
 <div class="fig"><img src="../figures/break_context.png" alt="Cut rate by the two bases before the cut">
@@ -31,46 +32,45 @@ all contexts: after <tt>GG</tt> or <tt>CC</tt> the cut rate is ~6&times; average
 base to the left, make no difference.
 <b>Without GG/CC, breaks are independent:</b> the fraction of whole-strand reads is 0.75, 0.56, 0.30, 0.13 at L&nbsp;=&nbsp;30, 60, 120, 200,
 matching (1&minus;p)<sup>L&minus;1</sup> with p&nbsp;&asymp;&nbsp;0.010.
-<b>Reads have errors:</b> 0.46% substitutions and 0.11% insertions per base, so 45% of 100-base reads contain one.
+<b>Reads have errors:</b> 0.46% substitutions and 0.11% insertions per base.
 <b>About 3% of strands are never read.</b> The same strands are lost again when resent (89 of 90), yet loss shows no link to
 length, GC content or any motif we tried, so we treat it as random.</p>
 
 <h2>How the design responds, and where each choice stops paying</h2>
-<p><b>Compression.</b> Coverage is plentiful, so score &asymp; density and compression is the main lever. An adaptive
-context-mixing model (byte orders 0&ndash;4, 6 and a word model) drives a binary arithmetic coder. The decoder rebuilds
-the same model as it decodes, so no code table is sent; an end-of-text flag replaces a length header.
-<i>Helps</i> at every length: 2.2&times; the score of raw bytes and ~15% above zlib (table). <i>Limit:</i> short passages compress
-worst because the model starts empty (density 2.7 at 150 characters, 4.1 at 4,000).</p>
-<p><b>GG/CC-free code.</b> Each strand's bits form one integer, mapped by enumerative ranking onto the strings with no GG or CC:
-1.83 bits/base instead of 2 (&minus;8.6%), but breaks fall ~4&times;, so 200&ndash;400-base strands still get many whole reads.
-<i>Without it,</i> strands must shrink to 32&ndash;52 bases, where index and CRC take 23&ndash;38% of each strand, and 13 of 20 real
-passages failed: random strands with many GG/CC sites almost never arrive whole (in one test 16 of 78 strands got no whole
-read, more than the parity could rebuild). Our simulator, using one average break rate, missed this (2.2 predicted, 0.56 real).</p>
-<p><b>Strands and decoding.</b> [index 8 | number of data strands 8 | payload | CRC-8]. The decoder finds L from the
-read-length spike, clusters whole-strand reads, takes a per-position majority vote and keeps candidates that pass the CRC.
-<i>Limit:</i> partial reads (most reads) are discarded; assembling them would allow longer strands.</p>
-<p><b>Reed&ndash;Solomon parity.</b> A systematic Cauchy code over GF(256): r parity strands rebuild any r lost strands. <i>Helps</i>
-long passages: without it, 20 of 40 simulated 4,000-character passages failed (0 of 40 with it), for an 11% density cost.
-<i>Doesn't help</i> short ones: one parity strand adds 33&ndash;100% more bases to remove a ~7% risk, so the planner uses none.
-At 1,000 characters it breaks even (simulated mean 3.15 with, 3.17 without).</p>
-<p><b>Planner.</b> Per passage, the encoder picks L and r to maximise density &times; P(at most r of n+r strands fail), where a
-strand fails if lost (3.5%) or if it gets fewer than 8 whole reads (Poisson). <i>Helps</i> most for short passages: a fixed
-L&nbsp;=&nbsp;200, r&nbsp;=&nbsp;2 scores 1.20 instead of 2.68 at 150 characters. Its risk model is a little cautious (predicts 5.1% failures;
-3.1% seen in 160 simulated passages). <b>Risk cap.</b> Capping failure risk at 1% cut simulated failures to 1 in 160 but lowers
-the mean score from 3.24 to 2.77, mostly on short passages; we chose expected score.</p>
+<p><b>Huffman compression (3.2.5).</b> Coverage is plentiful, so score &asymp; density. Each passage gets its own Huffman code over
+its bytes plus an end-of-text symbol; the code goes first as codeword lengths (4 bits per character used). <i>Helps:</i> 1.6&times; the
+score of raw bytes. <i>Limits:</i> the table costs 1.7 bits/char at 150 characters (28% of the output), 0.1 at 4,000; a built-in English
+table sends none and scores 2.91 vs 2.29 at 150 characters (equal from 1,000 on) but fits only English. Coding each character
+alone stays near 4.5 bits/char; context mixing, which predicts from earlier letters, reaches 3.1 on long passages.</p>
+<p><b>GG/CC-free code (6.1.4).</b> Each strand's bits form one integer, mapped by counting onto the strings with no GG or CC:
+1.83 bits/base instead of 2 (&minus;8.6%), but breaks fall ~4&times;, so 250&ndash;300-base strands still get many whole reads.
+<i>Without it,</i> strands must shrink to 36&ndash;64 bases, where the 28 header and check bits take 22&ndash;39% of each strand, and
+17 of 20 real passages failed: random strands with many GG/CC sites almost never arrive whole.</p>
+<p><b>Strands and decoding.</b> [index 8 | data strands n 8 | parity strands r 4 | payload | 8 parity bits]; parity bit j covers
+every 8th bit from j (3.3.3), so any burst of up to 8 flips is caught. The decoder finds L from the read-length spike, clusters
+whole-strand reads, votes per position, keeps strands that pass. <i>Limit:</i> partial reads unused.</p>
+<p><b>XOR parity strands (3.3.4).</b> A parity strand is the XOR of a group of data strands, so a group missing one strand rebuilds it.
+Groups overlap like a Hamming code's: each data strand's r-bit label has two or more 1s. <i>Helps</i> long
+passages: without it 4 of 5 real (28 of 40 simulated) 4,000-character passages failed. <i>Costs:</i> 6&ndash;7 parity strands on 36&ndash;58 data
+strands (density 3.07 &rarr; 2.64): two losses in the same groups cannot be untangled, where Reed&ndash;Solomon would need 2&ndash;3.
+<i>Doesn't help</i> short passages (one parity strand adds 33&ndash;100% bases to remove a ~10% risk): the planner uses none.</p>
+<p><b>Planner (2.4, 7.1).</b> Per passage the encoder picks L and r to maximise density &times; P(all data recovered). A strand fails if lost
+(3.5%) or given fewer than 8 whole reads (Poisson); failures are binomial, weighted by the share of loss patterns the groups repair.
+<i>Helps</i> short passages most: fixed L&nbsp;=&nbsp;200, r&nbsp;=&nbsp;2 scores 1.20, not 2.29, at 150 characters. It predicts 6.5% failures (5.6% seen in
+160 simulated). <b>Risk cap.</b> A 1% cap removed all simulated failures but cut the mean from 2.46 to 1.98; we chose expected score.</p>
 
 <h2>Evidence: turning off one piece at a time</h2>
 <table>
 <tr><th>Real channel, mean score (5 passages each)</th><th>150</th><th>250</th><th>1,000</th><th>4,000</th><th>mean</th><th>failed: real / sim</th></tr>
-<tr class="us"><td>Full design</td><td>2.68</td><td>2.95</td><td>3.26</td><td>4.06</td><td>3.24</td><td>0/20 &nbsp; 5/160</td></tr>
-<tr><td>No compression (raw bytes)</td><td>1.36</td><td>1.45</td><td>1.55</td><td>1.58</td><td>1.48</td><td>1/20 &nbsp; 6/160</td></tr>
-<tr><td>zlib instead of context mixing</td><td>2.31</td><td>2.50</td><td>2.86</td><td>3.53</td><td>2.80</td><td>0/20 &nbsp; 7/160</td></tr>
-<tr><td>GG/CC allowed (2 bits/base)</td><td>0.93</td><td>1.32</td><td>0.00</td><td>0.00</td><td>0.56</td><td>13/20 &nbsp; 5/160</td></tr>
-<tr><td>No parity strands</td><td>2.68</td><td>2.95</td><td>3.71</td><td>3.72</td><td>3.26</td><td>1/20 &nbsp; 30/160</td></tr>
-<tr><td>Fixed L = 200, r = 2</td><td>1.20</td><td>1.67</td><td>2.86</td><td>3.30</td><td>2.26</td><td>1/20 &nbsp; 4/160</td></tr>
-<tr><td>Risk capped at 1%</td><td>1.93</td><td>2.17</td><td>3.01</td><td>3.96</td><td>2.77</td><td>0/20 &nbsp; 1/160</td></tr>
+<tr class="us"><td>Full design</td><td>2.29</td><td>2.43</td><td>2.48</td><td>2.64</td><td>2.46</td><td>0/20 &nbsp; 9/160</td></tr>
+<tr><td>No compression (raw bytes)</td><td>1.67</td><td>1.43</td><td>1.42</td><td>1.49</td><td>1.50</td><td>0/20 &nbsp; 6/160</td></tr>
+<tr><td>Huffman, fixed English table</td><td>2.91</td><td>2.76</td><td>2.43</td><td>2.67</td><td>2.69</td><td>0/20 &nbsp; 8/160</td></tr>
+<tr><td>GG/CC allowed (2 bits/base)</td><td>0.26</td><td>0.56</td><td>0.00</td><td>0.00</td><td>0.20</td><td>17/20 &nbsp; 52/160</td></tr>
+<tr><td>No parity strands</td><td>2.29</td><td>2.43</td><td>2.73</td><td>0.72</td><td>2.04</td><td>4/20 &nbsp; 42/160</td></tr>
+<tr><td>Fixed L = 200, r = 2</td><td>1.20</td><td>1.48</td><td>1.81</td><td>1.14</td><td>1.41</td><td>4/20 &nbsp; 17/160</td></tr>
+<tr><td>Risk capped at 1%</td><td>1.65</td><td>1.70</td><td>2.08</td><td>2.51</td><td>1.98</td><td>0/20 &nbsp; 0/160</td></tr>
+<tr class="ref"><td>Context mixing (not course material)</td><td>2.67</td><td>2.92</td><td>3.23</td><td>3.97</td><td>3.20</td><td>0/20 &nbsp; 11/160</td></tr>
 </table>
-<p>Same excerpts in every row. 20 real runs are too few for failure rates, so the simulator's are shown too (wrong only for GG/CC).
-Earlier, the full design decoded 98 of 104 random excerpts exactly; all six failures were strands lost beyond the parity.</p>
+<p>Same excerpts in every row; failure rates also from 160 simulated runs. Ten real test passages: 2.66, all exact.</p>
 </body>
 </html>

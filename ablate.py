@@ -8,7 +8,7 @@ solution.py is not edited: each variant patches the module's globals inside a wo
 Every variant sees the same excerpts, so differences between rows are paired comparisons.
 Writes results/ablation_<mode>.csv (one row per run) and results/ablation_<mode>_summary.txt.
 """
-import contextlib, csv, math, os, random, sys, zlib
+import contextlib, csv, importlib.util, math, os, random, sys, zlib
 from multiprocessing import Pool
 
 import solution as S
@@ -16,6 +16,17 @@ from bench import Channel, evaluate, texts
 from sim import SimChannel
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+CM = _load("solution_cm", "experiments/solution_cm.py")   # our earlier version: context mixing
+FIXED = _load("partner_solution", "partner/solution.py")   # Huffman with a fixed English table
 LENGTHS = [150, 250, 1000, 4000]
 # Break rate per site for random (unconstrained) DNA, fitted on the real server from the fraction of
 # full-length reads of 100 random strands at L = 24..60 (0.30, 0.18, 0.10, 0.086, 0.039): p ~ 0.053.
@@ -25,7 +36,7 @@ P_BREAK_PLAIN = 0.053
 
 # ---------------------------------------------------------------- the planner's risk model
 def fail_prob(L, n, r, nchars):
-    """Planner's predicted P(passage unrecoverable): more than r of n+r strands fail."""
+    """Planner's predicted P(passage unrecoverable): the XOR groups cannot rebuild every lost strand."""
     N = n + r
     lam = 4 * nchars / (N * (1 - S.P_LOST)) * (1 - S.P_BREAK) ** (L - 1)
     term, p_few = math.exp(-lam), 0.0
@@ -33,10 +44,10 @@ def fail_prob(L, n, r, nchars):
         p_few += term
         term *= lam / (k + 1)
     q = S.P_LOST + (1 - S.P_LOST) * p_few
-    return 1 - S._binom_tail_ok(N, r, q)
+    return 1 - S._p_success(n, r, q)
 
 
-def plan(nbits, nchars, r_max=12):
+def plan(nbits, nchars, r_max=S.MAX_R):
     """Same search as solution._plan, with the parity count capped at r_max."""
     best = None
     for L in S.L_RANGE:
@@ -46,7 +57,7 @@ def plan(nbits, nchars, r_max=12):
         n = max(1, -(-nbits // (8 * K)))
         if n > 200:
             continue
-        for r in range(0, min(r_max, 255 - n) + 1):
+        for r in [x for x in [0, 1] + list(range(3, S.MAX_R + 1)) if x <= r_max]:
             pf = fail_prob(L, n, r, nchars)
             if pf > S.MAX_FAIL:
                 continue
@@ -91,6 +102,14 @@ def zlib_decompress(bits, stop_bit=None, limit=1 << 20):
         return b""
 
 
+def fixed_compress(data):                    # Huffman from a built-in English table: no table sent
+    return _bytes_to_bits(FIXED.compress(data.decode("utf-8")))
+
+
+def fixed_decompress(bits, stop_bit=None, limit=1 << 20):
+    return FIXED.decompress(_bits_to_bytes(bits if stop_bit is None else bits[:stop_bit])).encode("utf-8")[:limit]
+
+
 def plain_capacity(L):                       # no constrained code: 2 bits per base
     return 2 * L
 
@@ -112,7 +131,9 @@ def plain_rank(s):
 VARIANTS = {
     "full": {},
     "raw-bytes": {"compress": raw_compress, "decompress": raw_decompress},
+    "fixed-table": {"compress": fixed_compress, "decompress": fixed_decompress},
     "zlib": {"compress": zlib_compress, "decompress": zlib_decompress},
+    "context-mixing": {"compress": CM.compress, "decompress": CM.decompress},
     "no-constraint": {"capacity": plain_capacity, "unrank": plain_unrank, "rank": plain_rank,
                       # short strands decode from 1-3 clean full reads, so the 8-read rule
                       # (tuned for L ~ 300) would be unfairly strict here
@@ -124,9 +145,11 @@ VARIANTS = {
 DESCRIBE = {
     "full": "everything on (the submission)",
     "raw-bytes": "no compression (UTF-8 bytes)",
-    "zlib": "zlib/DEFLATE instead of context mixing",
+    "fixed-table": "Huffman with a fixed English table (no table sent)",
+    "zlib": "zlib/DEFLATE instead of Huffman",
+    "context-mixing": "our earlier context-mixing coder instead of Huffman",
     "no-constraint": "plain 2 bits/base, GG/CC allowed",
-    "no-parity": "no Reed-Solomon parity strands",
+    "no-parity": "no XOR parity strands",
     "fixed-plan": "fixed L=200, r=2 instead of per-passage plan",
     "safe": "risk cap MAX_FAIL=0.01",
 }
